@@ -1,0 +1,108 @@
+#!/bin/sh
+
+set -eu
+set -x
+
+show_usage() {
+    echo "Usage: updatepages [OPTION]
+
+Run hashurls for static-urls.txt and watched-urls.txt, then commit the results
+to the pages branch.
+
+Options:
+  -b BRANCH -- name of the branch to commit to (default: gh-pages)
+  -p        -- push changes after commit"
+}
+
+main() {
+    local branch push user pages_dir
+    branch='gh-pages'
+    push=''
+    user='download-integrity-service'
+
+    local opt OPTIND
+    while getopts b:hp opt; do
+        case "$opt" in
+            b) branch="$OPTARG" ;;
+            h) show_usage; exit ;;
+            p) push=1 ;;
+            u) user="$OPTARG" ;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+
+    if ! [ -d .git ]; then
+        echo 'Error: current directory is not a git repository' >&2
+        exit 1
+    fi
+
+    pages_dir="$(open_worktree "$branch")"
+    trap "rm '$pages_dir' -rf && git worktree prune" 0
+
+    if [ -f static-urls.txt ]; then
+        hashurls -p "$pages_dir" < static-urls.txt
+    fi
+
+    if [ -x discover-urls ]; then
+        ./discover-urls | hashurls -p "$pages_dir"
+    fi
+
+    if [ -f watched-urls.txt ]; then
+        hashurls -p "$pages_dir" -w < watched-urls.txt
+    fi
+
+    mkdir -p "$pages_dir/keys"
+
+    if [ -f key.pub ]; then
+        cp key.pub "$pages_dir/keys/pub"
+    fi
+
+    if [ -f key.mspub ]; then
+        cp key.mspub "$pages_dir/keys/mspub"
+    fi
+
+    (
+        cd "$pages_dir"
+        git add --all
+        git -c "user.name=$user" -c "user.email=$user@invalid" commit --message='Update' >/dev/null || true
+
+        if [ -n "$push" ]; then
+            git push origin "$branch"
+        fi
+    )
+}
+
+open_worktree() {
+    local current_branch worktree_path
+
+    worktree_path="$(mktemp -d dis.XXXXX -t)"
+    rmdir -- "$worktree_path"
+
+    if branch_exists "$1"; then
+        git worktree add --force "$worktree_path" "$1" >/dev/null
+    else
+        current_branch="$(get_current_branch)"
+        if [ -z "$current_branch" ] || [ "$current_branch" = "HEAD" ]; then
+            echo "Error: you must be on a branch. Have you made at least one commit yet?" >&2
+            exit 1
+        fi
+        git worktree add --force "$worktree_path" "$current_branch" >/dev/null
+        (
+            cd  "$worktree_path" &&
+            git checkout --orphan "$1" --quiet &&
+            git rm -rf .
+        ) >/dev/null
+    fi
+
+    printf '%s\n' "$worktree_path"
+}
+
+get_current_branch() {
+    git rev-parse --abbrev-ref HEAD
+}
+
+branch_exists() {
+    git show-ref --quiet --verify "refs/heads/$1"
+}
+
+main "$@"

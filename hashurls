@@ -1,0 +1,109 @@
+#!/bin/sh
+
+set -eu
+scriptroot="$(dirname -- "$0")"
+
+show_usage() {
+    echo "Usage: hashurls [OPTION]... [URL]...
+
+Download files at the specified URLs, then store signed hashes of the
+downloaded file to the results dir.  Once hashed, the file will not be
+downloaded again (unless you are watching the URL by passing the -w option).
+
+Options:
+  -k PATH -- path to signing key (default: key)
+  -p PATH -- directory to store results (default: \$PWD)
+  -w      -- check URLs for changes and re-hash downloads that have changed"
+}
+
+main() {
+    local key results_dir watching
+    key=key
+    results_dir="$PWD"
+    watching=''
+
+    local opt OPTIND
+    while getopts hk:p:w opt; do
+        case "$opt" in
+            h) show_usage; exit ;;
+            k) key="$OPTARG" ;;
+            p) results_dir="$OPTARG" ;;
+            w) watching=1 ;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+
+    if [ ! -f "$key" ]; then
+        echo "Key not found at '$key'. Generating a new one."
+        "$scriptroot/newsigningkey" "$key"
+    fi
+    key="$(realpath -- "$key")"
+
+    local url
+    if [ $# -eq 0 ]; then
+      hash_urls "$key"
+    else
+        for url; do
+            printf '%s' "$url"
+        done | hash_urls "$key"
+    fi
+}
+
+hash_urls() {
+    local url
+    while read -r url; do
+        hash_url "$url" "$1" || echo "Error hashing URL at '$url'" >&2
+    done
+}
+
+hash_url() {
+    local dldir dlfile path result
+    dldir="${TMPDIR:-/tmp}/hashurls.dl"
+    dlfile="$(basename -- "$1")"
+    path="$results_dir/$(url_to_path "$1")"
+    if [ -z "$watching" ] && [ -e "$path" ]; then
+        return
+    fi
+    if [ -n "$watching" ] && is_etag_unchanged "$1" "$path.etag"; then
+        return
+    fi
+
+    mkdir -p -- "$(dirname -- "$path")"
+    : >| "$path"
+    mkdir -p -- "$dldir"
+
+    echo "Downloading: $url" >&2
+    local result
+    result=0
+    download_file "$1" "$dldir/$dlfile" "$path.etag" && (
+        for algorithm in sha1 sha256 sha512; do
+            (cd -- "$dldir" && openssl dgst "-$algorithm" -hex "$dlfile") >> "$path" || exit 1
+        done
+    ) &&
+    ( cd -- "$dldir" && openssl dgst -sha256 -sign "$2" -hex "$dlfile") >> "$path" ||
+    result=$?
+    rm -f "$dldir/$dlfile"
+    return "$result"
+}
+
+url_to_path() {
+    printf '%s' "$1" | sed 's_^/__;s_://_/_'
+}
+
+is_etag_unchanged() {
+    [ -f "$2" ] && [ "$(get_url_etag "$1")" = "$(cat "$2")" ]
+}
+
+get_url_etag() {
+    curl --location --silent --head -- "$1" | extract_etag
+}
+
+download_file() {
+    curl --location --output "$2" --silent --dump-header - -- "$1" | extract_etag >| "$3"
+}
+
+extract_etag() {
+    sed -En 's/^ETag:\s+"([^"]+)"/\1/p' | tail -n 1
+}
+
+main "$@"
